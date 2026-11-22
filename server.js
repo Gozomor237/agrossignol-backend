@@ -5,8 +5,8 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-// ===== Paiements Pi Network (inchangé) =====
-const PI_API = 'https://api.pi.network/v2';
+// ===== Paiements Pi Network =====
+const PI_API = 'https://api.minepi.com/v2';
 const headers = () => ({
   'Authorization': `Key ${process.env.PI_API_KEY}`,
   'Content-Type': 'application/json'
