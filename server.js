@@ -12,13 +12,56 @@ const headers = () => ({
   'Content-Type': 'application/json'
 });
 
+// ===== Enregistrement des paiements (Supabase, uniquement côté serveur) =====
+const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SB_KEY = process.env.SUPABASE_SECRET_KEY || '';
+
+async function enregistrerPaiement(dto, statut, txid) {
+  try {
+    if (!SB_URL || !SB_KEY || !dto || !dto.identifier) return;
+    const h = {
+      'apikey': SB_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates,return=minimal'
+    };
+    if (SB_KEY.startsWith('eyJ')) h['Authorization'] = `Bearer ${SB_KEY}`;
+    const meta = dto.metadata || {};
+    const ligne = {
+      payment_id: dto.identifier,
+      montant: dto.amount,
+      memo: dto.memo || null,
+      produit_id: meta.productId != null ? String(meta.productId) : null,
+      vendeur: meta.seller || null,
+      pi_user_uid: dto.user_uid || null,
+      statut: statut,
+      mis_a_jour: new Date().toISOString()
+    };
+    if (txid) ligne.txid = txid;
+    const r = await fetch(`${SB_URL}/rest/v1/paiements?on_conflict=payment_id`, {
+      method: 'POST', headers: h, body: JSON.stringify(ligne)
+    });
+    if (!r.ok) {
+      console.error('Enregistrement paiement refusé', r.status, (await r.text()).slice(0, 300));
+    }
+  } catch (e) {
+    console.error('Enregistrement paiement impossible', e.message);
+  }
+}
+
+// Contrôle sans paiement : vérifie que les variables sont lues (n'affiche jamais la clé)
+app.get('/paiements/etat', (req, res) => {
+  res.json({ urlConfiguree: Boolean(SB_URL), cleConfiguree: Boolean(SB_KEY) });
+});
+
 app.post('/payment/approve', async (req, res) => {
   try {
     const { paymentId } = req.body;
     const r = await fetch(`${PI_API}/payments/${paymentId}/approve`, {
       method: 'POST', headers: headers()
     });
-    res.status(r.status).json(await r.json());
+    const data = await r.json();
+    if (r.ok) await enregistrerPaiement(data, 'approuve');
+    res.status(r.status).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -31,7 +74,11 @@ app.post('/payment/complete', async (req, res) => {
       method: 'POST', headers: headers(),
       body: JSON.stringify({ txid })
     });
-    res.status(r.status).json(await r.json());
+    const data = await r.json();
+    if (r.ok) {
+      await enregistrerPaiement(data, 'complete', txid || (data.transaction && data.transaction.txid));
+    }
+    res.status(r.status).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
