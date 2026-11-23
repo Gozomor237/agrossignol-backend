@@ -12,19 +12,32 @@ const headers = () => ({
   'Content-Type': 'application/json'
 });
 
-// ===== Enregistrement des paiements (Supabase, uniquement côté serveur) =====
+// ===== Supabase (uniquement côté serveur) =====
 const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SB_KEY = process.env.SUPABASE_SECRET_KEY || '';
+
+function sbHeaders(extra) {
+  const h = Object.assign({ 'apikey': SB_KEY, 'Content-Type': 'application/json' }, extra || {});
+  if (SB_KEY.startsWith('eyJ')) h['Authorization'] = `Bearer ${SB_KEY}`;
+  return h;
+}
+
+async function sb(path, opts) {
+  opts = opts || {};
+  const r = await fetch(`${SB_URL}/rest/v1/${path}`, {
+    method: opts.method || 'GET',
+    headers: sbHeaders(opts.headers),
+    body: opts.body
+  });
+  const texte = await r.text();
+  let json = null;
+  try { json = texte ? JSON.parse(texte) : null; } catch (e) {}
+  return { ok: r.ok, status: r.status, json, texte };
+}
 
 async function enregistrerPaiement(dto, statut, txid) {
   try {
     if (!SB_URL || !SB_KEY || !dto || !dto.identifier) return;
-    const h = {
-      'apikey': SB_KEY,
-      'Content-Type': 'application/json',
-      'Prefer': 'resolution=merge-duplicates,return=minimal'
-    };
-    if (SB_KEY.startsWith('eyJ')) h['Authorization'] = `Bearer ${SB_KEY}`;
     const meta = dto.metadata || {};
     const ligne = {
       payment_id: dto.identifier,
@@ -37,15 +50,74 @@ async function enregistrerPaiement(dto, statut, txid) {
       mis_a_jour: new Date().toISOString()
     };
     if (txid) ligne.txid = txid;
-    const r = await fetch(`${SB_URL}/rest/v1/paiements?on_conflict=payment_id`, {
-      method: 'POST', headers: h, body: JSON.stringify(ligne)
+    const r = await sb('paiements?on_conflict=payment_id', {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(ligne)
     });
     if (!r.ok) {
-      console.error('Enregistrement paiement refusé', r.status, (await r.text()).slice(0, 300));
+      console.error('Enregistrement paiement refusé', r.status, (r.texte || '').slice(0, 300));
     }
   } catch (e) {
     console.error('Enregistrement paiement impossible', e.message);
   }
+}
+
+// ===== Commandes =====
+async function lireAnnonce(id) {
+  const r = await sb(`annonces?id=eq.${encodeURIComponent(id)}&select=id,titre,prix_pi,unite,stock,vendeur,vendeur_uid,vendeur_pi&limit=1`);
+  if (!r.ok) throw new Error('Lecture annonce impossible');
+  return (r.json && r.json[0]) || null;
+}
+
+async function creerCommande(dto, a) {
+  try {
+    const r = await sb('commandes?on_conflict=payment_id', {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=ignore-duplicates,return=minimal' },
+      body: JSON.stringify({
+        payment_id: dto.identifier,
+        annonce_id: String(a.id),
+        titre: a.titre,
+        unite: a.unite || null,
+        montant: dto.amount,
+        acheteur_uid: dto.user_uid || null,
+        vendeur_uid: a.vendeur_uid || null,
+        vendeur_pi: a.vendeur_pi || null,
+        vendeur_nom: a.vendeur || null,
+        statut: 'en_attente_paiement'
+      })
+    });
+    if (!r.ok) console.error('Création commande refusée', r.status, (r.texte || '').slice(0, 300));
+  } catch (e) {
+    console.error('Création commande impossible', e.message);
+  }
+}
+
+// Passe la commande en « paiement confirmé » et diminue le stock une seule fois
+async function confirmerCommande(paymentId) {
+  try {
+    const r = await sb(`commandes?payment_id=eq.${encodeURIComponent(paymentId)}&statut=eq.en_attente_paiement`, {
+      method: 'PATCH',
+      headers: { 'Prefer': 'return=representation' },
+      body: JSON.stringify({ statut: 'paiement_confirme', mis_a_jour: new Date().toISOString() })
+    });
+    const lignes = (r.ok && Array.isArray(r.json)) ? r.json : [];
+    if (lignes.length && lignes[0].annonce_id) {
+      const s = await sb('rpc/decrementer_stock', {
+        method: 'POST',
+        body: JSON.stringify({ p_annonce: String(lignes[0].annonce_id) })
+      });
+      if (!s.ok) console.error('Stock non mis à jour', s.status, (s.texte || '').slice(0, 300));
+    }
+  } catch (e) {
+    console.error('Confirmation commande impossible', e.message);
+  }
+}
+
+async function refuser(dto, raison) {
+  console.error('Paiement refusé', dto && dto.identifier, raison);
+  await enregistrerPaiement(dto, 'refuse');
 }
 
 // Contrôle sans paiement : vérifie que les variables sont lues (n'affiche jamais la clé)
@@ -55,12 +127,50 @@ app.get('/paiements/etat', (req, res) => {
 
 app.post('/payment/approve', async (req, res) => {
   try {
-    const { paymentId } = req.body;
-    const r = await fetch(`${PI_API}/payments/${paymentId}/approve`, {
+    const { paymentId } = req.body || {};
+    if (!paymentId) return res.status(400).json({ error: 'paymentId manquant' });
+
+    // 1) Lire le paiement chez Pi (montant et produit réels)
+    const pr = await fetch(`${PI_API}/payments/${encodeURIComponent(paymentId)}`, { headers: headers() });
+    const dto = await pr.json();
+    if (!pr.ok) return res.status(pr.status).json(dto);
+    if (dto.status && dto.status.developer_approved) return res.status(200).json(dto);
+
+    // 2) Vérifier le produit, le prix et le stock dans Supabase
+    const meta = dto.metadata || {};
+    let annonce = null;
+    try {
+      annonce = meta.productId != null ? await lireAnnonce(meta.productId) : null;
+    } catch (e) {
+      return res.status(503).json({ error: 'Vérification du produit impossible. Réessayez.' });
+    }
+    if (!annonce) {
+      await refuser(dto, 'produit introuvable');
+      return res.status(400).json({ error: 'Produit introuvable.' });
+    }
+    const prix = Number(annonce.prix_pi);
+    if (!(prix > 0) || Math.abs(Number(dto.amount) - prix) > 1e-6) {
+      await refuser(dto, 'montant différent du prix');
+      return res.status(400).json({ error: 'Le montant ne correspond pas au prix du produit.' });
+    }
+    if (annonce.stock != null && Number(annonce.stock) < 1) {
+      await refuser(dto, 'stock épuisé');
+      return res.status(400).json({ error: 'Produit épuisé.' });
+    }
+    if (annonce.vendeur_uid && annonce.vendeur_uid === dto.user_uid) {
+      await refuser(dto, 'achat de sa propre annonce');
+      return res.status(400).json({ error: 'Vous ne pouvez pas acheter votre propre annonce.' });
+    }
+
+    // 3) Approuver chez Pi, puis enregistrer paiement et commande
+    const r = await fetch(`${PI_API}/payments/${encodeURIComponent(paymentId)}/approve`, {
       method: 'POST', headers: headers()
     });
     const data = await r.json();
-    if (r.ok) await enregistrerPaiement(data, 'approuve');
+    if (r.ok) {
+      await enregistrerPaiement(data, 'approuve');
+      await creerCommande(data, annonce);
+    }
     res.status(r.status).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -69,18 +179,44 @@ app.post('/payment/approve', async (req, res) => {
 
 app.post('/payment/complete', async (req, res) => {
   try {
-    const { paymentId, txid } = req.body;
-    const r = await fetch(`${PI_API}/payments/${paymentId}/complete`, {
+    const { paymentId, txid } = req.body || {};
+    const r = await fetch(`${PI_API}/payments/${encodeURIComponent(paymentId)}/complete`, {
       method: 'POST', headers: headers(),
       body: JSON.stringify({ txid })
     });
     const data = await r.json();
     if (r.ok) {
       await enregistrerPaiement(data, 'complete', txid || (data.transaction && data.transaction.txid));
+      await confirmerCommande(paymentId);
     }
     res.status(r.status).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// Achats et ventes de la personne connectée (identité Pi vérifiée côté serveur)
+app.get('/mon-activite', async (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ erreur: 'Connexion Pi requise.' });
+    const me = await fetch(`${PI_API}/me`, { headers: { 'Authorization': auth } });
+    if (!me.ok) return res.status(401).json({ erreur: 'Connexion Pi invalide. Reconnectez-vous.' });
+    const u = await me.json();
+    if (!u || !u.uid) return res.status(401).json({ erreur: 'Connexion Pi invalide.' });
+
+    const uid = encodeURIComponent(u.uid);
+    const cols = 'payment_id,annonce_id,titre,unite,montant,statut,vendeur_nom,cree_le';
+    const filtre = 'statut=neq.en_attente_paiement&order=cree_le.desc&limit=50';
+    const achats = await sb(`commandes?acheteur_uid=eq.${uid}&select=${cols}&${filtre}`);
+    const nom = encodeURIComponent(u.username || '');
+    const cond = nom ? `or=(vendeur_uid.eq.${uid},vendeur_pi.eq.${nom})` : `vendeur_uid=eq.${uid}`;
+    const ventes = await sb(`commandes?${cond}&select=${cols}&${filtre}`);
+    if (!achats.ok || !ventes.ok) return res.status(502).json({ erreur: 'Lecture des commandes impossible.' });
+    res.json({ achats: achats.json || [], ventes: ventes.json || [] });
+  } catch (e) {
+    console.error('Erreur mon-activite', e.message);
+    res.status(500).json({ erreur: 'Impossible de charger votre activité.' });
   }
 });
 
