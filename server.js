@@ -271,6 +271,47 @@ app.post('/mon-profil', async (req, res) => {
   }
 });
 
+// Supprime une annonce : seulement par son propriétaire (identité Pi vérifiée côté serveur)
+app.post('/annonce/supprimer', async (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ erreur: 'Connexion Pi requise.' });
+    const me = await fetch(`${PI_API}/me`, { headers: { 'Authorization': auth } });
+    if (!me.ok) return res.status(401).json({ erreur: 'Connexion Pi invalide. Reconnectez-vous.' });
+    const u = await me.json();
+    if (!u || !u.uid) return res.status(401).json({ erreur: 'Connexion Pi invalide.' });
+
+    const id = req.body && req.body.id;
+    if (id == null || id === '') return res.status(400).json({ erreur: 'Annonce manquante.' });
+
+    const r = await sb(`annonces?id=eq.${encodeURIComponent(id)}&select=id,vendeur_uid,vendeur_pi&limit=1`);
+    if (!r.ok) return res.status(502).json({ erreur: 'Lecture de l\'annonce impossible.' });
+    const a = r.json && r.json[0];
+    if (!a) return res.status(404).json({ erreur: 'Annonce introuvable.' });
+
+    const proprio = (a.vendeur_uid && a.vendeur_uid === u.uid) ||
+      (a.vendeur_pi && u.username && String(a.vendeur_pi).toLowerCase() === String(u.username).toLowerCase());
+    if (!proprio) return res.status(403).json({ erreur: 'Vous ne pouvez supprimer que vos propres annonces.' });
+
+    // Supprime d'abord les commentaires de l'annonce, puis l'annonce
+    const c = await sb(`commentaires?annonce_id=eq.${encodeURIComponent(id)}`, {
+      method: 'DELETE', headers: { 'Prefer': 'return=minimal' }
+    });
+    if (!c.ok) console.error('Suppression commentaires refusée', c.status, (c.texte || '').slice(0, 300));
+    const d = await sb(`annonces?id=eq.${encodeURIComponent(id)}`, {
+      method: 'DELETE', headers: { 'Prefer': 'return=minimal' }
+    });
+    if (!d.ok) {
+      console.error('Suppression annonce refusée', d.status, (d.texte || '').slice(0, 300));
+      return res.status(502).json({ erreur: 'Impossible de supprimer l\'annonce.' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Erreur annonce/supprimer', e.message);
+    res.status(500).json({ erreur: 'Impossible de supprimer l\'annonce.' });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'OK' });
 });
