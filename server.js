@@ -220,6 +220,57 @@ app.get('/mon-activite', async (req, res) => {
   }
 });
 
+// ===== Profils publics (photo, nom, présentation) =====
+// Contrôle sans effet : vérifie que la route existe
+app.get('/profils/etat', (req, res) => {
+  res.json({ ok: true, supabase: Boolean(SB_URL && SB_KEY) });
+});
+
+// Enregistre le profil de la personne connectée (identité Pi vérifiée côté serveur)
+app.post('/mon-profil', async (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ erreur: 'Connexion Pi requise.' });
+    const me = await fetch(`${PI_API}/me`, { headers: { 'Authorization': auth } });
+    if (!me.ok) return res.status(401).json({ erreur: 'Connexion Pi invalide. Reconnectez-vous.' });
+    const u = await me.json();
+    if (!u || !u.uid || !u.username) return res.status(401).json({ erreur: 'Connexion Pi invalide.' });
+
+    const b = req.body || {};
+    const ligne = {
+      pi_uid: u.uid,
+      pi_username: u.username,
+      mis_a_jour: new Date().toISOString()
+    };
+
+    if (typeof b.nom === 'string') ligne.nom = b.nom.trim().slice(0, 60) || u.username;
+    if (typeof b.bio === 'string') ligne.bio = b.bio.trim().slice(0, 300);
+    if (typeof b.localite === 'string') ligne.localite = b.localite.trim().slice(0, 60);
+    if (typeof b.photo_url === 'string') {
+      const p = b.photo_url.trim();
+      // La photo doit venir de notre propre stockage Supabase
+      if (p && p.indexOf(SB_URL + '/storage/v1/object/public/photos/') !== 0) {
+        return res.status(400).json({ erreur: 'Photo non valide.' });
+      }
+      ligne.photo_url = p || null;
+    }
+
+    const r = await sb('profils?on_conflict=pi_uid', {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' },
+      body: JSON.stringify(ligne)
+    });
+    if (!r.ok) {
+      console.error('Enregistrement profil refusé', r.status, (r.texte || '').slice(0, 300));
+      return res.status(502).json({ erreur: 'Impossible d\'enregistrer le profil.' });
+    }
+    res.json({ profil: (Array.isArray(r.json) && r.json[0]) || ligne });
+  } catch (e) {
+    console.error('Erreur mon-profil', e.message);
+    res.status(500).json({ erreur: 'Impossible d\'enregistrer le profil.' });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'OK' });
 });
