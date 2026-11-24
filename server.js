@@ -332,6 +332,21 @@ Analyse la photo de plante et réponds UNIQUEMENT en JSON valide, en français, 
 Si l'image n'est pas une plante, mets maladie "Image non reconnue" et severite "aucune".
 Le diagnostic est une estimation : reste prudent.`;
 
+// Même consigne en anglais : les clés JSON et la valeur de "severite" restent identiques
+const CONSIGNE_EN = `You are an expert agronomist advising farmers in Cameroon.
+Analyze the plant photo and reply ONLY with valid JSON, in English, with this structure:
+{"maladie":"likely name of the problem, or Healthy plant","emoji":"one emoji",
+"severite":"aucune or faible or moyenne or élevée",
+"description":"1 to 2 sentences",
+"confiance":85,
+"symptomes":["observed symptom 1","observed symptom 2"],
+"traitements":[{"emoji":"🌿","texte":"treatment 1"},{"emoji":"💧","texte":"treatment 2"}],
+"prevention":["prevention tip 1","prevention tip 2"],
+"produit_recommande":"natural or locally available product"}
+The JSON keys and the value of "severite" must stay exactly as shown (severite is one of: aucune, faible, moyenne, élevée). Every other text value must be in English.
+If the image is not a plant, set maladie to "Unrecognized image" and severite to "aucune".
+The diagnosis is an estimate: stay cautious.`;
+
 // Test sans photo : vérifie que la clé est chargée (n'affiche jamais la clé)
 app.get('/diagnostic/etat', (req, res) => {
   res.json({ cleConfiguree: Boolean(process.env.GEMINI_KEY), modeles: MODELES });
@@ -342,7 +357,8 @@ app.post('/diagnostic', async (req, res) => {
   if (!cle) {
     return res.status(500).json({ erreur: "Service IA non configuré sur le serveur." });
   }
-  const { image, mimeType } = req.body || {};
+  const { image, mimeType, langue } = req.body || {};
+  const consigne = langue === 'en' ? CONSIGNE_EN : CONSIGNE;
   if (!image || typeof image !== 'string') {
     return res.status(400).json({ erreur: "Aucune image reçue." });
   }
@@ -361,7 +377,7 @@ app.post('/diagnostic', async (req, res) => {
         body: JSON.stringify({
           contents: [{ parts: [
             { inline_data: { mime_type: type, data: image } },
-            { text: CONSIGNE }
+            { text: consigne }
           ] }],
           generationConfig: { temperature: 0.4, maxOutputTokens: 4000, responseMimeType: 'application/json' }
         })
