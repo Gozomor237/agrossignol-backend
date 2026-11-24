@@ -317,7 +317,8 @@ app.get('/', (req, res) => {
 });
 
 // ===== Diagnostic IA des plantes =====
-const MODELES = [process.env.GEMINI_MODEL || 'gemini-3.8-flash', 'gemini-3.7-flash'];
+const MODELES = [process.env.GEMINI_MODEL, 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash']
+  .filter((m, i, a) => m && a.indexOf(m) === i);
 
 const CONSIGNE = `Tu es un agronome expert qui conseille des producteurs au Cameroun.
 Analyse la photo de plante et réponds UNIQUEMENT en JSON valide, en français, avec cette structure :
@@ -352,6 +353,40 @@ app.get('/diagnostic/etat', (req, res) => {
   res.json({ cleConfiguree: Boolean(process.env.GEMINI_KEY), modeles: MODELES });
 });
 
+// Test sans photo : interroge chaque modèle avec une phrase courte et montre la réponse ou l'erreur exacte
+app.get('/diagnostic/test', async (req, res) => {
+  const cle = process.env.GEMINI_KEY;
+  if (!cle) return res.json({ cleConfiguree: false });
+  const essais = await Promise.all(MODELES.map(async (modele) => {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), 8000);
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modele}:generateContent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cle },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: 'Reply with the single word OK.' }] }],
+          generationConfig: { maxOutputTokens: 50 }
+        }),
+        signal: c.signal
+      });
+      const txt = await r.text();
+      let msg = txt.slice(0, 300);
+      try {
+        const j = JSON.parse(txt);
+        const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+        msg = (j.error && j.error.message) || parts.map(p => p.text || '').join('') || msg;
+      } catch (e) {}
+      return { modele, statut: r.status, ok: r.ok, message: String(msg).slice(0, 200) };
+    } catch (e) {
+      return { modele, statut: 0, ok: false, message: e.name === 'AbortError' ? 'Pas de réponse en 8 secondes' : e.message };
+    } finally {
+      clearTimeout(t);
+    }
+  }));
+  res.json({ cleConfiguree: true, essais });
+});
+
 app.post('/diagnostic', async (req, res) => {
   const cle = process.env.GEMINI_KEY;
   if (!cle) {
@@ -367,6 +402,8 @@ app.post('/diagnostic', async (req, res) => {
   }
   const type = ['image/jpeg', 'image/png', 'image/webp'].includes(mimeType) ? mimeType : 'image/jpeg';
 
+  const ctrl = new AbortController();
+  const minuteur = setTimeout(() => ctrl.abort(), 40000);
   try {
     let reponse = null;
     for (const modele of MODELES) {
@@ -380,7 +417,8 @@ app.post('/diagnostic', async (req, res) => {
             { text: consigne }
           ] }],
           generationConfig: { temperature: 0.4, maxOutputTokens: 4000, responseMimeType: 'application/json' }
-        })
+        }),
+        signal: ctrl.signal
       });
       if (reponse.status !== 404) break; // modèle introuvable : on essaie le suivant
     }
@@ -407,7 +445,12 @@ app.post('/diagnostic', async (req, res) => {
     res.json(resultat);
   } catch (e) {
     console.error('Erreur diagnostic', e);
+    if (e && e.name === 'AbortError') {
+      return res.status(504).json({ erreur: "Le service IA met trop de temps à répondre. Réessayez." });
+    }
     res.status(500).json({ erreur: "Impossible d'analyser l'image. Réessayez avec une photo plus nette." });
+  } finally {
+    clearTimeout(minuteur);
   }
 });
 
