@@ -353,13 +353,19 @@ app.get('/diagnostic/etat', (req, res) => {
   res.json({ cleConfiguree: Boolean(process.env.GEMINI_KEY), modeles: MODELES });
 });
 
-// Test sans photo : interroge chaque modèle avec une phrase courte et montre la réponse ou l'erreur exacte
+// Test sans photo : interroge plusieurs modèles avec une phrase courte, montre le code, le message et le temps de réponse.
+// Options : ?delai=25 (secondes d'attente, 3 à 50) et ?modele=nom-du-modele
 app.get('/diagnostic/test', async (req, res) => {
   const cle = process.env.GEMINI_KEY;
   if (!cle) return res.json({ cleConfiguree: false });
-  const essais = await Promise.all(MODELES.map(async (modele) => {
+  const delai = Math.min(50, Math.max(3, parseInt(req.query.delai, 10) || 8)) * 1000;
+  const extras = ['gemini-2.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash-lite'];
+  let liste = req.query.modele ? [String(req.query.modele)] : MODELES.concat(extras);
+  liste = liste.filter((m, i, a) => /^[A-Za-z0-9.\-]+$/.test(m) && a.indexOf(m) === i);
+  const essais = await Promise.all(liste.map(async (modele) => {
+    const debut = Date.now();
     const c = new AbortController();
-    const t = setTimeout(() => c.abort(), 8000);
+    const t = setTimeout(() => c.abort(), delai);
     try {
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modele}:generateContent`, {
         method: 'POST',
@@ -377,9 +383,9 @@ app.get('/diagnostic/test', async (req, res) => {
         const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
         msg = (j.error && j.error.message) || parts.map(p => p.text || '').join('') || msg;
       } catch (e) {}
-      return { modele, statut: r.status, ok: r.ok, message: String(msg).slice(0, 200) };
+      return { modele, statut: r.status, ok: r.ok, ms: Date.now() - debut, message: String(msg).slice(0, 200) };
     } catch (e) {
-      return { modele, statut: 0, ok: false, message: e.name === 'AbortError' ? 'Pas de réponse en 8 secondes' : e.message };
+      return { modele, statut: 0, ok: false, ms: Date.now() - debut, message: e.name === 'AbortError' ? 'Pas de réponse en ' + (delai / 1000) + ' secondes' : e.message };
     } finally {
       clearTimeout(t);
     }
