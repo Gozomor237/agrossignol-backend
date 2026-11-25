@@ -317,8 +317,10 @@ app.get('/', (req, res) => {
 });
 
 // ===== Diagnostic IA des plantes =====
-const MODELES = [process.env.GEMINI_MODEL, 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash']
-  .filter((m, i, a) => m && a.indexOf(m) === i);
+// Modèles confirmés rapides par le test du 25 nov. 2026 (3.5-flash : 0,5 s ; 3.5-flash-lite : 0,4 s).
+// gemini-3.7-flash ne répondait pas et gemini-2.5-* sont retirés : ils ne sont plus utilisés.
+const MODELES = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash'];
+const DELAI_MODELE_MS = 20000; // attente maximale par modèle avant de passer au suivant
 
 const CONSIGNE = `Tu es un agronome expert qui conseille des producteurs au Cameroun.
 Analyse la photo de plante et réponds UNIQUEMENT en JSON valide, en français, avec cette structure :
@@ -348,6 +350,27 @@ The JSON keys and the value of "severite" must stay exactly as shown (severite i
 If the image is not a plant, set maladie to "Unrecognized image" and severite to "aucune".
 The diagnosis is an estimate: stay cautious.`;
 
+// Appelle un modèle Gemini avec son propre délai maximum
+async function appelerGemini(modele, cle, corps, delaiMs) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), delaiMs);
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modele}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cle },
+      body: JSON.stringify(corps),
+      signal: c.signal
+    });
+    const txt = await r.text();
+    return { statut: r.status, ok: r.ok, txt };
+  } catch (e) {
+    if (e && e.name === 'AbortError') return { statut: 0, ok: false, txt: 'delai depasse' };
+    return { statut: -1, ok: false, txt: e.message };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // Test sans photo : vérifie que la clé est chargée (n'affiche jamais la clé)
 app.get('/diagnostic/etat', (req, res) => {
   res.json({ cleConfiguree: Boolean(process.env.GEMINI_KEY), modeles: MODELES });
@@ -359,36 +382,23 @@ app.get('/diagnostic/test', async (req, res) => {
   const cle = process.env.GEMINI_KEY;
   if (!cle) return res.json({ cleConfiguree: false });
   const delai = Math.min(50, Math.max(3, parseInt(req.query.delai, 10) || 8)) * 1000;
-  const extras = ['gemini-2.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash-lite'];
+  const extras = ['gemini-3.7-flash', 'gemini-3.8-flash'];
   let liste = req.query.modele ? [String(req.query.modele)] : MODELES.concat(extras);
   liste = liste.filter((m, i, a) => /^[A-Za-z0-9.\-]+$/.test(m) && a.indexOf(m) === i);
   const essais = await Promise.all(liste.map(async (modele) => {
     const debut = Date.now();
-    const c = new AbortController();
-    const t = setTimeout(() => c.abort(), delai);
+    const r = await appelerGemini(modele, cle, {
+      contents: [{ parts: [{ text: 'Reply with the single word OK.' }] }],
+      generationConfig: { maxOutputTokens: 300 }
+    }, delai);
+    let msg = r.txt.slice(0, 300);
     try {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modele}:generateContent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cle },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: 'Reply with the single word OK.' }] }],
-          generationConfig: { maxOutputTokens: 50 }
-        }),
-        signal: c.signal
-      });
-      const txt = await r.text();
-      let msg = txt.slice(0, 300);
-      try {
-        const j = JSON.parse(txt);
-        const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
-        msg = (j.error && j.error.message) || parts.map(p => p.text || '').join('') || msg;
-      } catch (e) {}
-      return { modele, statut: r.status, ok: r.ok, ms: Date.now() - debut, message: String(msg).slice(0, 200) };
-    } catch (e) {
-      return { modele, statut: 0, ok: false, ms: Date.now() - debut, message: e.name === 'AbortError' ? 'Pas de réponse en ' + (delai / 1000) + ' secondes' : e.message };
-    } finally {
-      clearTimeout(t);
-    }
+      const j = JSON.parse(r.txt);
+      const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+      msg = (j.error && j.error.message) || parts.map(p => p.text || '').join('') || msg;
+    } catch (e) {}
+    if (r.statut === 0) msg = 'Pas de réponse en ' + (delai / 1000) + ' secondes';
+    return { modele, statut: r.statut, ok: r.ok, ms: Date.now() - debut, message: String(msg).slice(0, 200) };
   }));
   res.json({ cleConfiguree: true, essais });
 });
@@ -408,55 +418,68 @@ app.post('/diagnostic', async (req, res) => {
   }
   const type = ['image/jpeg', 'image/png', 'image/webp'].includes(mimeType) ? mimeType : 'image/jpeg';
 
-  const ctrl = new AbortController();
-  const minuteur = setTimeout(() => ctrl.abort(), 40000);
+  const corps = {
+    contents: [{ parts: [
+      { inline_data: { mime_type: type, data: image } },
+      { text: consigne }
+    ] }],
+    generationConfig: { temperature: 0.4, maxOutputTokens: 4000, responseMimeType: 'application/json' }
+  };
+
+  // On essaie chaque modèle dans l'ordre : si l'un échoue (introuvable, trop lent,
+  // surchargé, réponse vide ou illisible), on passe au suivant.
+  let dernier = { statut: 0, detail: '' };
   try {
-    let reponse = null;
     for (const modele of MODELES) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modele}:generateContent`;
-      reponse = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cle },
-        body: JSON.stringify({
-          contents: [{ parts: [
-            { inline_data: { mime_type: type, data: image } },
-            { text: consigne }
-          ] }],
-          generationConfig: { temperature: 0.4, maxOutputTokens: 4000, responseMimeType: 'application/json' }
-        }),
-        signal: ctrl.signal
-      });
-      if (reponse.status !== 404) break; // modèle introuvable : on essaie le suivant
+      const r = await appelerGemini(modele, cle, corps, DELAI_MODELE_MS);
+
+      if (!r.ok) {
+        console.error('Erreur Gemini', modele, r.statut, (r.txt || '').slice(0, 300));
+        dernier = { statut: r.statut, detail: r.txt || '' };
+        // Problème de clé : inutile d'essayer les autres modèles
+        if (r.statut === 401 || r.statut === 403 || /API key/i.test(r.txt || '')) break;
+        continue;
+      }
+
+      let texte = '';
+      try {
+        const data = JSON.parse(r.txt);
+        const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+        texte = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
+      } catch (e) {}
+      if (!texte) {
+        console.error('Réponse Gemini vide', modele);
+        dernier = { statut: 200, detail: 'vide' };
+        continue;
+      }
+
+      try {
+        const resultat = JSON.parse(texte.replace(/```json|```/g, '').trim());
+        return res.json(resultat);
+      } catch (e) {
+        console.error('Réponse Gemini illisible', modele);
+        dernier = { statut: 200, detail: 'illisible' };
+        continue;
+      }
     }
 
-    if (!reponse.ok) {
-      const detail = await reponse.text();
-      console.error('Erreur Gemini', reponse.status, detail.slice(0, 500));
-      if (reponse.status === 429) {
-        return res.status(429).json({ erreur: "Le service IA est très sollicité. Réessayez dans une minute." });
-      }
-      if (reponse.status === 401 || reponse.status === 403 || /API key/i.test(detail)) {
-        return res.status(502).json({ erreur: "Le service IA refuse la clé du serveur. Contactez l'administrateur." });
-      }
-      return res.status(502).json({ erreur: "Le service IA est momentanément indisponible." });
+    // Aucun modèle n'a réussi
+    if (dernier.statut === 401 || dernier.statut === 403 || /API key/i.test(dernier.detail)) {
+      return res.status(502).json({ erreur: "Le service IA refuse la clé du serveur. Contactez l'administrateur." });
     }
-
-    const data = await reponse.json();
-    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-    const texte = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
-    if (!texte) {
-      return res.status(502).json({ erreur: "L'IA n'a pas renvoyé de réponse. Essayez avec une autre photo." });
+    if (dernier.statut === 429) {
+      return res.status(429).json({ erreur: "Le service IA est très sollicité. Réessayez dans une minute." });
     }
-    const resultat = JSON.parse(texte.replace(/```json|```/g, '').trim());
-    res.json(resultat);
-  } catch (e) {
-    console.error('Erreur diagnostic', e);
-    if (e && e.name === 'AbortError') {
+    if (dernier.statut === 0) {
       return res.status(504).json({ erreur: "Le service IA met trop de temps à répondre. Réessayez." });
     }
+    if (dernier.statut === 200) {
+      return res.status(502).json({ erreur: "L'IA n'a pas renvoyé de réponse exploitable. Essayez avec une autre photo." });
+    }
+    return res.status(502).json({ erreur: "Le service IA est momentanément indisponible." });
+  } catch (e) {
+    console.error('Erreur diagnostic', e);
     res.status(500).json({ erreur: "Impossible d'analyser l'image. Réessayez avec une photo plus nette." });
-  } finally {
-    clearTimeout(minuteur);
   }
 });
 
